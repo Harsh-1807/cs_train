@@ -1,0 +1,208 @@
+Here’s a structured breakdown of your questions and actionable recommendations for preparing your custom dataset for **SemDINO** or similar semantic change detection (SCD) frameworks:
+
+---
+
+---
+
+## **1. Dataset Structure for Custom Data**
+Your dataset should mimic the structure of the benchmarks used in the paper (e.g., Landsat-SCD, SECOND, HRSCD). Here’s how to organize it:
+
+### **Directory Structure**
+```
+custom_dataset/
+├── im1/          # T1 images (2021, 0.05m resolution)
+│   ├── tile_001.tif
+│   ├── tile_002.tif
+│   └── ...
+├── im2/          # T2 images (2025, 0.035m resolution)
+│   ├── tile_001.tif
+│   ├── tile_002.tif
+│   └── ...
+├── label1/       # Semantic labels for T1 (optional, if supervised)
+│   ├── tile_001.png
+│   └── ...
+├── label2/       # Semantic labels for T2 (optional)
+│   ├── tile_001.png
+│   └── ...
+└── train_list.txt  # List of tile IDs for training (e.g., "tile_001\n tile_002")
+└── val_list.txt    # List for validation
+└── test_list.txt   # List for testing
+```
+
+### **Key Requirements**
+- **File Formats**:
+  - **Images**: `.tif` (georeferenced) or `.png` (lossless).
+  - **Labels**: `.png` with class indices (e.g., 0=No Change, 1=Farmland, 2=Building, etc.).
+    *If using RGB labels (like HRSCD), include a `palette.py` to map colors to class indices.*
+
+- **Class Definitions**:
+  Define a consistent set of semantic classes (e.g., `No Change`, `Agriculture`, `Urban`, `Water`, `Forest`).
+  Example for 5 classes:
+  ```python
+  # In your dataset loader (e.g., custom_dataset.py)
+  CLASSES = ['No Change', 'Agriculture', 'Urban', 'Water', 'Forest']
+  ```
+
+- **Normalization**:
+  Compute dataset-specific **mean/std** for each temporal image (T1 and T2 separately) if the resolutions differ.
+  Example:
+  ```python
+  # For T1 (2021, 0.05m)
+  mean_t1 = [0.485, 0.456, 0.406]  # Example: Replace with your dataset's stats
+  std_t1 = [0.229, 0.224, 0.225]
+
+  # For T2 (2025, 0.035m)
+  mean_t2 = [0.480, 0.450, 0.400]  # Recompute if upsampled
+  std_t2 = [0.230, 0.225, 0.226]
+  ```
+
+---
+
+---
+
+## **2. Handling Resolution Mismatch (0.05m vs. 0.035m)**
+### **Should You Upsample 0.035m to 0.05m?**
+**Yes**, for **consistency** in the model’s input. SemDINO (and most SCD models) assume **co-registered, same-resolution** bi-temporal pairs.
+*Rationale*:
+- The model’s **FPN (Feature Pyramid Network)** and **DINOv3 adapter** expect aligned spatial dimensions.
+- Misaligned resolutions can introduce **pseudo-changes** (false positives) due to scaling artifacts.
+
+---
+
+### **Best Upsampling Method**
+| Method               | Pros                          | Cons                          | Recommendation |
+|----------------------|-------------------------------|-------------------------------|----------------|
+| **Bilinear**         | Fast, smooth transitions      | Blurs edges                   | ❌ Avoid       |
+| **Bicubic**          | Sharper than bilinear         | Still loses high-frequency details | ⚠️ Okay       |
+| **Lanczos**          | Preserves edges better        | Computationally heavier      | ✅ **Best**    |
+| **Nearest-Neighbor** | No interpolation (pixelated)  | Introduces blocky artifacts   | ❌ Avoid       |
+| **Super-Resolution**| Recovers details (e.g., ESRGAN)| Overkill for this use case    | ⚠️ Overhead   |
+
+**Use Lanczos resampling** (via `rasterio` or `GDAL`):
+```python
+import rasterio
+from rasterio.enums import Resampling
+
+# Upsample 0.035m to 0.05m (scale factor = 0.05/0.035 ≈ 1.428)
+with rasterio.open('2025_0.035m.tif') as src:
+    data = src.read()
+    transform = src.transform * src.transform.scale(1.428, 1.428)  # Scale transform
+    profile = src.profile.copy()
+    profile.update(transform=transform, width=int(src.width * 1.428), height=int(src.height * 1.428))
+
+    with rasterio.open('2025_upsampled_0.05m.tif', 'w', **profile) as dst:
+        for band in range(data.shape[0]):
+            rasterio.warp.reproject(
+                data[band],
+                dst=dst,
+                src_transform=src.transform,
+                src_crs=src.crs,
+                dst_transform=transform,
+                dst_crs=src.crs,
+                resampling=Resampling.lanczos
+            )
+```
+
+**Alternative (GDAL CLI)**:
+```bash
+gdalwarp -tr 0.05 0.05 -r lanczos input_0.035m.tif output_0.05m.tif
+```
+
+---
+
+---
+
+## **3. Handling Non-512×512 Tiles**
+### **Problem**
+Tiling often creates edge tiles with dimensions **< 512×512** (e.g., 480×512 or 512×320).
+SemDINO’s default `DataLoader` expects **fixed-size inputs** (512×512).
+
+---
+
+### **Solutions**
+#### **Option 1: Pad Tiles to 512×512 (Recommended)**
+- **How**: Pad with **reflect** or **constant** (e.g., 0 or mean value).
+- **Pros**: Simple, no data loss.
+- **Cons**: Introduces artificial borders (may affect edge pixels).
+
+**Implementation (Python + `numpy`)**:
+```python
+import numpy as np
+from PIL import Image
+
+def pad_to_512(image):
+    h, w = image.shape[:2]
+    pad_h = 512 - h
+    pad_w = 512 - w
+    # Pad with reflection (avoids sharp edges)
+    padded = np.pad(image, ((0, pad_h), (0, pad_w), (0, 0)), mode='reflect')
+    return padded
+
+# Example usage
+tile = np.array(Image.open('tile_480x512.tif'))
+padded_tile = pad_to_512(tile)
+Image.fromarray(padded_tile).save('tile_padded_512x512.tif')
+```
+
+#### **Option 2: Resize Tiles to 512×512**
+- **How**: Use **Lanczos resampling** (same as upsampling).
+- **Pros**: No padding artifacts.
+- **Cons**: Distorts aspect ratio slightly (may affect small objects).
+
+**Implementation**:
+```python
+from PIL import Image
+img = Image.open('tile_480x512.tif')
+resized = img.resize((512, 512), resample=Image.Resampling.LANCZOS)
+resized.save('tile_resized_512x512.tif')
+```
+
+#### **Option 3: Dynamic Batching (Advanced)**
+- **How**: Modify the `DataLoader` to handle variable sizes (requires custom collate function).
+- **Pros**: No padding/resizing artifacts.
+- **Cons**: Complex to implement; may slow down training.
+
+**Example Collate Function**:
+```python
+from torch.nn.utils.rnn import pad_sequence
+
+def collate_fn(batch):
+    images_t1 = [item[0] for item in batch]  # List of T1 images (variable size)
+    images_t2 = [item[1] for item in batch]  # List of T2 images
+    labels = [item[2] for item in batch]    # List of labels
+
+    # Pad sequences to max size in batch
+    images_t1 = pad_sequence(images_t1, batch_first=True)
+    images_t2 = pad_sequence(images_t2, batch_first=True)
+    labels = pad_sequence(labels, batch_first=True)
+
+    return images_t1, images_t2, labels
+```
+
+---
+
+---
+
+## **Summary of Recommendations**
+| **Question**               | **Answer**                                                                 |
+|----------------------------|---------------------------------------------------------------------------|
+| **Dataset Structure**      | Follow `im1/`, `im2/`, `label1/`, `label2/` with `.tif`/`.png` files.      |
+| **Resolution Mismatch**    | Upsample 0.035m → 0.05m using **Lanczos resampling** (GDAL/rasterio).      |
+| **Non-512×512 Tiles**      | **Pad to 512×512** with `mode='reflect'` (simplest and most robust).       |
+| **Normalization**          | Compute **per-temporal** mean/std (T1 and T2 separately).                |
+| **Class Labels**           | Use **integer indices** (0=No Change, 1=Class1, etc.) in `.png` files.     |
+
+---
+
+---
+### **Next Steps**
+1. **Preprocess your data**:
+   - Upsample 2025 (0.035m) → 0.05m using Lanczos.
+   - Pad all tiles to 512×512.
+   - Compute `mean_t1`, `std_t1`, `mean_t2`, `std_t2`.
+
+2. **Create a custom dataset loader**:
+   Modify `datasets/RS_Landsat.py` to point to your `im1/`, `im2/`, and labels.
+
+3. **Test with a small subset**:
+   Run `pred.py` on 5–10 tiles to verify the pipeline works before full training.
