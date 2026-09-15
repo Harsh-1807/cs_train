@@ -1,0 +1,58 @@
+Here's a prioritized list, roughly in order of expected impact-per-effort for SECOND specifically (7-class, semantic change detection, Fscd/Sek/mIoU as your metrics).
+
+## 1. Fix the class imbalance in the loss (probably your single biggest lever)
+
+SECOND is dominated by `unchanged`/background pixels and common classes (ground, low vegetation), while `sports field` and `water` are rare. Right now:
+- `CrossEntropyLoss2d(ignore_index=0)` — you're using flat CE with no class weighting.
+- `FocalLoss` / `FocalLoss2d` / `DiceLoss` exist in `utils/loss.py` but are unused.
+
+Concrete change: compute per-class pixel frequency over the train split, weight CE inversely (or use median-frequency balancing), and combine with Dice on the segmentation heads — CE+Dice is close to standard-of-practice for imbalanced semantic segmentation. This alone often moves mIoU/Sek more than architecture tweaks.
+
+## 2. Class-balanced/hard-example sampling, not just loss weighting
+
+A weighted loss reweights gradients but every image is still seen equally often. Consider a `WeightedRandomSampler` (or offline oversampling) that upweights image pairs containing rare classes (water, sports field) so the model sees them more often per epoch, not just harder on them when it does.
+
+## 3. Deep supervision at intermediate scales
+
+`MultiScaleTBTT` produces aligned features at 4 scales but only the finest 3 feed `ChangeFusion`, and only the final fused output gets supervised. Adding auxiliary segmentation/change heads at 1–2 intermediate scales (tiny extra conv heads, discarded at inference, weighted ~0.3–0.4 in the loss) is a well-established trick that speeds convergence and often improves final accuracy — cheap to add given the pyramid already exists.
+
+## 4. Stronger, change-detection-specific augmentation
+
+Right now you have `rand_rot90_flip_MCD`. A few augmentations specifically help SCD generalize:
+- **Independent color jitter per timestamp** (not synced between im1/im2) — teaches the model to be robust to seasonal/illumination differences between acquisitions rather than treating any color shift as "change." This is one of the highest-value augmentations specifically for change detection.
+- **Copy-paste / synthetic change injection** — paste a segmented object from one image into the paired image at the same location to synthesize hard positive "changed" examples, especially useful for rare-class change (helps with the imbalance from #1/#2 too).
+- Random scale/crop (multi-scale training) rather than fixed-size only, if your patches currently come in at one resolution.
+
+## 5. EMA of model weights
+
+Maintain an exponential moving average of weights alongside the raw trained weights, validate/checkpoint using the EMA copy. This is close to free (a few lines, negligible compute) and reliably gives +0.5–1.5 points on segmentation-style metrics by smoothing out the noisy end of SGD training — very worth adding to `train.py`.
+
+## 6. LR schedule: cosine + warmup instead of pure polynomial decay
+
+Polynomial decay from iteration 0 with your frozen-DINOv3 + fresh-EfficientNet setup means the untrained EfficientNet/FPN/attention layers get hit with the full `lr=0.01` immediately. A short linear warmup (a few hundred iterations) before the decay schedule kicks in stabilizes early training, especially with a frozen foundation-model branch running alongside a from-scratch CNN branch — mismatched training dynamics between the two branches early on is a real failure mode here.
+
+## 7. Layer-wise / branch-wise learning rates
+
+You're already freezing DINOv3 entirely. Consider *not* freezing it fully — instead use a much smaller LR (e.g. 1/100th) for DINOv3's last few unfrozen layers, and normal LR for EfficientNet/FPN/attention. Full freezing is safe but leaves accuracy on the table since DINOv3's features are general-purpose, not change-detection-tuned; a light partial fine-tune with a tiny LR often helps without the instability of full fine-tuning.
+
+## 8. Multi-scale test-time inference (not just flips)
+
+`pred.py` already does 4-way flip TTA — worth adding multi-scale TTA on top (run at 0.75×/1.0×/1.25× input scale, resize logits back, average). This is one of the more reliable free wins at inference time for segmentation-style tasks and stacks with what you already have.
+
+## 9. Post-process the change mask
+
+A cheap addition: small connected-component removal (drop change blobs under N pixels) or morphological opening/closing on the binary change mask before it's written out. SCD models commonly produce salt-and-pepper false positives at class boundaries; a few lines of `skimage.morphology` cleanup measurably improves Fscd on some benchmarks without touching the model.
+
+## 10. Consistency/symmetry loss between the two temporal directions
+
+Your `TBTT` does bidirectional cross-attention (T1→T2 and T2→T1) but nothing explicitly enforces that swapping input order (im1, im2) → (im2, im1) gives a consistent change mask. Adding a symmetry-consistency loss term (or just symmetrizing the change logits at inference: run both orders, average) reduces order-dependent artifacts.
+
+## 11. Stochastic weight averaging (SWA) as a training-tail trick
+
+In the last ~10–15% of epochs, switch to a cyclical/constant LR and average checkpoints (distinct from EMA — SWA averages a handful of full checkpoints post-hoc rather than continuously). Often gives another small bump combined with #5, at basically zero extra training cost since you're checkpointing anyway.
+
+---
+
+**My actual priority order if you want me to implement:** #1 (class-weighted CE+Dice) and #5 (EMA) are the highest value-per-line-of-code changes and directly touch code I already gave you in `train.py`. #4's independent color jitter is also cheap and specifically addresses a known SCD failure mode (false positives from illumination differences, not real change).
+
+Want me to implement any of these? I'd suggest starting with #1 + #5 together since they're both training-loop changes I can drop into the `train.py` I already wrote for you.
