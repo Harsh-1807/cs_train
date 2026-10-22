@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.pt
+*.pkl
+artifacts/*.pt
+artifacts/*.pkl
+artifacts/split_manifest.json
+artifacts/training_meta.json
+artifacts/graph_meta.json
+outputs/
+*.egg-info/
+.pytest_cache/
+.DS_Store
