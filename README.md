@@ -4,6 +4,13 @@ Unsupervised GNN pipeline for AMI smart-meter communication health analysis.
 
 See [docs/METHODOLOGY.md](docs/METHODOLOGY.md) for full methodology, sheet/column omit list, and dual training modes.
 
+## Branches
+
+| Branch | Pipeline | Train script |
+|--------|----------|--------------|
+| `ami-comm-health` | v1: Graph MAE + HGT-2L + HDBSCAN | `./scripts/train.sh` |
+| `ami-sota-v2` | v2: MAE + contrastive + DEC + temporal DCU | `./scripts/train_v2.sh` |
+
 ## Quick start (GPU machine — e.g. NVIDIA A50)
 
 ```bash
@@ -11,10 +18,17 @@ cd ami-intelligence
 chmod +x scripts/*.sh
 ./scripts/setup.sh
 ./scripts/eda.sh ../lexus-large.xlsx
-./scripts/train.sh ../lexus-large.xlsx              # mode=full (default)
-./scripts/train.sh ../lexus-large.xlsx --mode split # feeder holdout
+
+# v1 baseline
+./scripts/train.sh ../lexus-large.xlsx
+
+# v2 SOTA (recommended for stronger results)
+./scripts/train_v2.sh ../lexus-large.xlsx
+
 ./scripts/evaluate.sh ../lexus-large.xlsx
 ```
+
+See [docs/METHODOLOGY_V2.md](docs/METHODOLOGY_V2.md) for v2 architecture details.
 
 ## Predict on test data
 

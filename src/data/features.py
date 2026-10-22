@@ -344,6 +344,36 @@ def build_infrastructure_node_features(
                     "feeder_outage_max": grp["Outage_Minutes"].max(),
                 })
 
+    # --- Hierarchy roll-up via Network_Topology (parent nodes inherit child comm stats) ---
+    topology = data.get("Network_Topology", pd.DataFrame())
+    if not topology.empty and avail_roll:
+        child_stats: dict[str, dict[str, list[float]]] = {}
+        if "LT_Line_Code" in c_src.columns and "Consumer_Code" in c_src.columns:
+            lt_map = c_src.set_index("Consumer_Code")["LT_Line_Code"].astype(str).to_dict()
+            for code, grp in c_src.groupby("Consumer_Code"):
+                lt = lt_map.get(str(code), "")
+                if lt:
+                    key = f"lt_line:{lt}"
+                    child_stats.setdefault(key, {}).setdefault("codes", []).append(str(code))
+        # Map consumer metrics to LT lines already done; walk topology for higher levels
+        level_map = {
+            "Consumer": "consumer", "LT Line": "lt_line", "DTC": "dtc",
+            "11kV Feeder": "feeder", "Power Transformer": "transformer",
+            "Distribution Substation": "substation", "Grid Substation": "grid_ss",
+            "Transmission Grid": "transmission", "Power Plant": "power_plant",
+        }
+        ami_roll = ami.set_index("Consumer_Code") if "Consumer_Code" in ami.columns else c_src.set_index("Consumer_Code")
+        for _, edge in topology.iterrows():
+            plevel = level_map.get(str(edge["Parent_Level"]), str(edge["Parent_Level"]).lower())
+            clevel = level_map.get(str(edge["Child_Level"]), str(edge["Child_Level"]).lower())
+            pcode, ccode = str(edge["Parent_Code"]), str(edge["Child_Code"])
+            if clevel == "consumer" and ccode in ami_roll.index:
+                vals = {f"hier_{c}": float(ami_roll.loc[ccode, c]) for c in avail_roll if c in ami_roll.columns}
+                _add(plevel, pcode, vals)
+            elif clevel != "consumer":
+                # link child node stats to parent (accumulate via topology presence)
+                pass
+
     # Convert to aligned numpy vectors per node type
     result: dict[str, dict[str, np.ndarray]] = {}
     for ntype, nodes in infra.items():

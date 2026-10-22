@@ -34,6 +34,7 @@ def build_hetero_graph(
     train_mask: np.ndarray | None = None,
     test_mask: np.ndarray | None = None,
     infra_feature_dim: int = 16,
+    dtc_temporal: dict[str, np.ndarray] | None = None,
 ) -> tuple[HeteroData, dict[str, Any]]:
     """
     Build HeteroData with consumer nodes and infrastructure nodes carrying
@@ -126,12 +127,14 @@ def build_hetero_graph(
         rows = []
         for code in code_list:
             if code in type_feats and isinstance(type_feats[code], np.ndarray):
-                v = type_feats[code]
-                if len(v) < fdim:
-                    v = np.pad(v, (0, fdim - len(v)))
-                rows.append(v[:fdim])
+                v = type_feats[code].flatten().astype(np.float32)
             else:
-                rows.append(rng.normal(0, 0.01, fdim).astype(np.float32))
+                v = rng.normal(0, 0.01, fdim).astype(np.float32)
+            if ntype == "dtc" and dtc_temporal and code in dtc_temporal:
+                v = np.concatenate([v, dtc_temporal[code].flatten().astype(np.float32)])
+            rows.append(v)
+        max_dim = max((len(r) for r in rows), default=fdim)
+        rows = [np.pad(r, (0, max_dim - len(r))) for r in rows]
         feat = torch.tensor(np.stack(rows), dtype=torch.float32)
         hetero[ntype].x = feat
         hetero[ntype].num_nodes = n
